@@ -100,7 +100,7 @@ pub mod pallet {
 	#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
 	pub struct PricePayload<Public, BlockNumber> {
 		block_number: BlockNumber,
-		parsed_price: (u64, Permill),
+		parsedprice: (u64, Permill),
 		public: Public,
 	}
 
@@ -259,24 +259,23 @@ pub mod pallet {
 		/// By default unsigned transactions are disallowed, but implementing the validator
 		/// here we make sure that some particular calls (the ones produced by offchain worker)
 		/// are being whitelisted and marked as valid.
-		fn validate_unsigned(_source: TransactionSource, call: &Self::Call)
-		-> TransactionValidity
+		fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity
 		{
-			let valid_tx = |provide|{ ValidTransaction::with_tag_prefix("ocw-demo")
+			let valid_tx = |provide|ValidTransaction::with_tag_prefix("ocw-demo")
 			.priority(UNSIGNED_TXS_PRIORITY)
 			.and_provides([&provide])
 			.longevity(3)
 			.propagate(true)
-			.build()};
+			.build();
 
 			match call {
-				Call::submit_number_unsigned(_number) => { valid_tx(b"submit_number_unsigned".to_vec())},
+				Call::submit_number_unsigned(_number) => valid_tx(b"submit_number_unsigned".to_vec()),
 				Call::submit_number_unsigned_with_signed_payload(ref payload, ref signature) => {
 					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
 						return InvalidTransaction::BadProof.into();
 					}
 					valid_tx(b"submit_number_unsigned_with_signed_payload".to_vec())
-				} //,
+				} 
 				_ => InvalidTransaction::Call.into(),
 			}
 		}
@@ -284,7 +283,7 @@ pub mod pallet {
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T> {
-		#[pallet::weight(10000)]
+		#[pallet::weight(100)]
 		pub fn submit_number_signed(origin: OriginFor<T>, number: u64) -> DispatchResult {
 			let who = ensure_signed(origin)?;
 			log::info!("submit_number_signed: ({}, {:?})", number, who);
@@ -294,7 +293,7 @@ pub mod pallet {
 			Ok(())
 		}
 
-		#[pallet::weight(10000)]
+		#[pallet::weight(100)]
 		pub fn submit_number_unsigned(origin: OriginFor<T>, number: u64) -> DispatchResult {
 			let _ = ensure_none(origin)?;
 			log::info!("submit_number_unsigned: {}", number);
@@ -304,7 +303,7 @@ pub mod pallet {
 			Ok(())
 		}
 
-		#[pallet::weight(10000)]
+		#[pallet::weight(100)]
 		pub fn submit_number_unsigned_with_signed_payload(origin: OriginFor<T>, payload: Payload<T::Public>,
 			_signature: T::Signature) -> DispatchResult
 		{
@@ -319,17 +318,17 @@ pub mod pallet {
 			Ok(())
 		}
 
-		#[pallet::weight(10000)]
+		#[pallet::weight(100)]
 		pub fn submit_price_unsigned_with_signed_payload(
 			origin: OriginFor<T>,
 			price_payload: PricePayload<T::Public, T::BlockNumber>,
 			_signature: T::Signature,
 		) -> DispatchResult {
 			let _ = ensure_none(origin)?;
-			let PricePayload { block_number: _, parsed_price, public: _ } = price_payload;
+			let PricePayload { block_number: _, parsedprice, public: _ } = price_payload;
 			log::info!("unsigned with signed payload");
-			Self::append_or_replace_price(parsed_price);
-			Self::deposit_event(Event::UpdatePrice(None, parsed_price));
+			Self::append_or_replace_price(parsedprice);
+			Self::deposit_event(Event::UpdatePrice(None, parsedprice));
 			Ok(())
 		}
 	}
@@ -370,50 +369,53 @@ pub mod pallet {
 			// 这个 http 请求可得到当前 DOT 价格：
 			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
 
+			//在storage里查询
 			let s_info = StorageValueRef::persistent(b"offchain-demo::price-info");
 			if let Ok(Some(price_info)) = s_info.get::<PriceInfo>() {
 				log::info!("cached price-info: {:?}", price_info);
 				return Ok(());
 			}
+
+			//上锁
 			let mut lock = StorageLock::<BlockAndTime<Self>>::with_block_and_time_deadline(
 				b"offchain-demo::price-lock",
 				LOCK_BLOCK_EXPIRATION,
 				rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION),
 			);
+
+			//从api获取价格
 			if let Ok(_guard) = lock.try_lock() {
 				match Self::fetch_price_parse() {
-					Ok(price_info) => {
-						s_info.set(&price_info);
-					}
-					Err(err) => {
-						return Err(err);
-					}
+					Ok(price_info) => {s_info.set(&price_info);}
+					Err(err) => {return Err(err);}
 				}
 			}
+
 			let price_info = s_info.get::<PriceInfo>().unwrap().unwrap();
 			let price_str = str::from_utf8(&price_info.price_usd).map_err(|_| {
-				log::warn!("解析失败");
+				log::warn!("parse failed");
 				<Error<T>>::ParseFailed
 			})?;
-			let parsed_price = match Self::parse_price(&price_str) {
-				Some(parsed_price) => Ok(parsed_price),
+			let parsedprice = match Self::parse_price(&price_str) {
+				Some(parsedprice) => Ok(parsedprice),
 				None => Err(<Error<T>>::ParseFailed),
 			}?;
 
 
-			let signer = Signer::<T, T::AuthorityId>::any_account();
-			if let Some((_, res)) = signer.send_unsigned_transaction(
-				|account| PricePayload { block_number, parsed_price, public: account.public.clone() },
+			// 通过链下工作机发送http请求获取dot当前价格，无签名但带有签名payload上链。原因: 价格是公开数据，与账户无关，无需签名。 为了增加数据可靠性，对数据签名验证。
+			let result = Signer::<T, T::AuthorityId>::any_account().send_unsigned_transaction(
+				|account| PricePayload { block_number, parsedprice, public: account.public.clone() },
 				Call::submit_price_unsigned_with_signed_payload,
-			) {
+			) ;
+			if let Some((_, res)) = result{
 				return res.map_err(|_| {
 					log::error!("offchain_unsigned_tx_signed_payload");
 					<Error<T>>::OffchainUnsignedTxSignedPayloadError
 				});
+			} else {
+				log::error!("no account");
+				Err(<Error<T>>::NoAccount)
 			}
-			log::error!("no account");
-			Err(<Error<T>>::NoAccount)
-
 
 		}
 
@@ -446,17 +448,26 @@ pub mod pallet {
 		}
 
 		fn fetch_price_from_remote() -> Result<Vec<u8>, Error<T>> {
+
+			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
 			let request = rt_offchain::http::Request::get(HTTP_USD_DOT_PRICE_REMOTE_REQUEST);
+
+			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
 			let timeout = sp_io::offchain::timestamp()
 				.add(rt_offchain::Duration::from_millis(FETCH_TIMEOUT_PERIOD));
+
+			//  Setting the timeout time  & Sending the request out by the host
 			let pending = request
 				.deadline(timeout)  
 				.send()  
 				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+
+			// The returning value here is a `Result` of `Result`, so we are unwrapping it twice by two `?`
 			let response = pending
 				.try_wait(timeout)
 				.map_err(|_| <Error<T>>::HttpFetchingError)?
 				.map_err(|_| <Error<T>>::HttpFetchingError)?;
+				
 			if response.code != 200 {
 				log::error!("Unexpected http request status code: {}", response.code);
 				return Err(<Error<T>>::HttpFetchingError);
